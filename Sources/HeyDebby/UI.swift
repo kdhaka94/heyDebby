@@ -525,10 +525,8 @@ struct NotchView: View {
 
             HStack(spacing: 14) {
                 if state.pendingNeed != nil && !state.agentBusy {
-                    // The agent stopped before something irreversible and is waiting —
-                    // "I did it" means something else here, so this gets its own labels.
-                    // !agentBusy matches the sibling branch below: don't offer Confirm
-                    // until the run is actually done, not just until it printed the line.
+                    // A generic agent can pause for missing information. Browser-policy
+                    // denials never use this resume path.
                     Button { state.confirmNeed() } label: {
                         Label("Confirm", systemImage: "checkmark.circle.fill")
                             .font(.system(size: 11, weight: .semibold))
@@ -544,7 +542,7 @@ struct NotchView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .tint(.red)
-                    .help("Abandon the agent's paused session — the browser stays open")
+                    .help("Abandon the agent's paused session")
                 } else if state.showNext && !state.isThinking && !state.isListening {
                     Button { state.submit("Done — what's the next step?") } label: {
                         Label("I did it", systemImage: "checkmark.circle.fill")
@@ -823,7 +821,7 @@ struct ProfileSection: View {
                     .controlSize(.small).disabled(state.agentBusy)
                 if state.agentBusy { ProgressView().controlSize(.mini) }
                 Spacer(minLength: 4)
-                Button("Delete profile") { Profile.delete() }
+                Button("Delete profile") { state.deleteProfile() }
                     .controlSize(.small)
             }
             .frame(width: 260)
@@ -925,15 +923,9 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Toggle("Agents: full access (skips sandbox/permissions — risky)", isOn: $agentFullAccess)
-            Toggle("Let Debby control apps (volume, Spotify, menus)", isOn: $appControl)
-            Text("Debby runs short AppleScript commands. macOS asks permission the first "
-                 + "time she talks to a named app, in Privacy & Security → Automation — "
-                 + "some commands, like volume, don't go through that gate at all.")
-                .font(.caption).foregroundStyle(.secondary)
-                .frame(width: 260, alignment: .leading)
-            Text("Once you allow an app, Debby can control it fully, not just the one thing "
-                 + "you asked for. She also decides what to run from what's on your screen, "
-                 + "so a web page or email can influence it. Leave this off unless you want that.")
+            Toggle("Let Debby control volume and media", isOn: $appControl)
+            Text("Debby can change volume and control play/pause, next, or previous in "
+                 + "Music and Spotify. These are fixed actions, not generated scripts.")
                 .font(.caption).foregroundStyle(.secondary)
                 .frame(width: 260, alignment: .leading)
             Toggle("Let Debby fill forms in a real browser (Playwright)", isOn: Binding(
@@ -945,9 +937,9 @@ struct SettingsView: View {
             ))
             .disabled(!Claude.CLI.isLoggedIn)
             if Claude.CLI.isLoggedIn {
-                Text("Debby fills forms in a real browser and stops for your OK before "
-                     + "anything is submitted. Registers a browser tool with the claude "
-                     + "CLI, so your other claude sessions can see it too.")
+                Text("Debby fills safe fields automatically. Passwords, payments and final "
+                     + "submissions stay in the visible browser for you. HeyDebby grants the "
+                     + "tool only while this is on; user-scoped Claude sessions can also see its registration.")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(width: 260, alignment: .leading)
             } else {

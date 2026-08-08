@@ -7,7 +7,8 @@ func shellQuote(_ s: String) -> String {
 /// Pure command builder (selfcheck-tested). backend: "codex" or "claude".
 func agentCommand(backend: String, task: String, screenshotPath: String?,
                   fullAccess: Bool, appControl: Bool = false,
-                  session: String? = nil, resume: Bool = false) -> String {
+                  session: String? = nil, resume: Bool = false,
+                  browser: Bool = false, settingsPath: String? = nil) -> String {
     if backend == "codex" {
         // `codex exec` has no session-resume equivalent, so session/resume are ignored here.
         var cmd = "codex exec --skip-git-repo-check"
@@ -24,23 +25,22 @@ func agentCommand(backend: String, task: String, screenshotPath: String?,
     // would force --output-format json and break the streaming ticker the notch relies on).
     var sessionFlag = ""
     if let s = session { sessionFlag = resume ? " -r \(shellQuote(s))" : " --session-id \(shellQuote(s))" }
-    if fullAccess {
+    if fullAccess && !browser {
         return "claude -p\(sessionFlag) --dangerously-skip-permissions \(shellQuote(prompt))"
     }
     // Without an allowlist `claude -p` denies every tool, so an app task fails silently.
     // --allowedTools is variadic: it must be last, and the prompt must precede it.
-    // Bash(osascript:*) is scoped rather than bare Bash deliberately: an agent that can
-    // run AppleScript is a much smaller grant than one that can run anything — but an
-    // agent's osascript call runs raw, never through BeatSplitter's refusal list, so it
-    // is only handed out when the user has app control switched on. Off by default in
-    // Settings means off here too, not a second door that skips the toggle.
-    // mcp__playwright is granted unconditionally, the same way mcp__composio is: an
-    // allowed tool name nobody registered with the CLI is simply unusable, so listing it
-    // here costs nothing when the browser-control toggle has never been switched on. The
-    // real gate is `browserNote` below — see its comment.
-    var tools = "mcp__composio mcp__playwright Read Glob Grep"
-    if appControl { tools += " Bash(osascript:*)" }
-    return "claude -p\(sessionFlag) \(shellQuote(prompt)) --allowedTools \(tools)"
+    var tools = "mcp__composio Read Glob Grep"
+    if browser { tools += " mcp__playwright" }
+    let settingsFlag = settingsPath.map { " --settings \(shellQuote($0))" } ?? ""
+    return "claude -p\(sessionFlag)\(settingsFlag) \(shellQuote(prompt)) --allowedTools \(tools)"
+}
+
+let playwrightMCPVersion = "0.0.79"
+
+func browserSetupCommand(userDataDir: String) -> String {
+    "claude mcp add playwright --scope user -- npx -y @playwright/mcp@\(playwrightMCPVersion) "
+        + "--user-data-dir \(shellQuote(userDataDir))"
 }
 
 // Both CLIs have the Composio MCP gateway registered (connect.composio.dev) —
@@ -53,34 +53,28 @@ If an app isn't connected yet, use COMPOSIO_MANAGE_CONNECTIONS and print the con
 so the user can authorize it in their browser.)
 """
 
-/// Appended to every agent task while browser control is on. No per-task classification:
-/// a note costs less than code that guesses which tasks are form tasks.
-///
-/// The profile PATH is passed, never its contents — a passport number on a command line
-/// is visible to every process on the machine via `ps`.
-///
-/// This is the ONLY thing standing between the agent and clicking Submit on a real form —
-/// mcp__playwright sits in `agentCommand`'s allowlist unconditionally (see its comment),
-/// so once the Playwright server is registered, whether Debby actually READS this note is
-/// the entire safety boundary. That is also why `AppState.disableBrowserControl()`
-/// unregisters the server when the toggle goes off: without that, turning browser control
-/// "off" would silently stop attaching this note to future tasks while leaving the browser
-/// tool itself fully callable — the one guardrail gone, the capability still live.
-let browserNote = """
+/// Guidance appended while browser control is on. The executable boundary is
+/// `BrowserPolicy`; this text explains how the agent should respond to a denial.
+/// The profile path is included only after its stored structure validates, and profile
+/// contents never appear on the command line.
+func browserGuidance(profileURL: URL?) -> String {
+    let profile: String
+    if let profileURL {
+        profile = "The user's validated details are in \(profileURL.path); read that file when an ordinary form field asks for them."
+    } else {
+        profile = "No validated profile is available. Do not invent missing personal details."
+    }
+    return """
 
-(You can drive a real browser with the Playwright tools. The user's own details — name, \
-date of birth, ID numbers, address — are in \(Profile.url.path); read that file when a \
-form asks for them, and say so if it is missing or lacks the field you need.
+    (You can drive a real browser with the Playwright tools. \(profile)
 
-Leave the browser window open so the user can watch and take over.
+    Leave the browser open so the user can watch and take over. Never type a password, card \
+    number, one-time code, or CAPTCHA response. The browser policy enforces the final boundary.
 
-NEVER type a password, a card number, or a one-time code. NEVER attempt a CAPTCHA. NEVER \
-click Submit, Pay, Confirm, or anything else that cannot be undone.
-
-When you reach any of those, or the form's own review page, print exactly one line:
-NEED: <one sentence saying what you need or what is about to happen>
-then stop and do nothing further. The user answers, and you will be resumed.)
-"""
+    If a browser operation is denied, stop immediately and leave the browser open for the user \
+    to complete that action directly. Do not ask to resume or retry the denied operation.)
+    """
+}
 
 /// The login shell an app-launched CLI gets: `-l` sources .zprofile but NOT .zshrc,
 /// so anything a user set up interactively (nvm etc.) is absent — hence the explicit PATH.
@@ -111,6 +105,11 @@ final class OutputBox: @unchecked Sendable {
     var text: String { lock.lock(); defer { lock.unlock() }; return buf }
 }
 
+enum ProcessLogging {
+    case standard
+    case privateOutput(label: String)
+}
+
 // Background agents = Codex CLI (ChatGPT subscription) or Claude Code CLI.
 enum AgentRunner {
     /// Returns the running process so callers can terminate it (nil if launch failed).
@@ -119,18 +118,57 @@ enum AgentRunner {
     static func run(backend: String, task: String, screenshotPath: String?, fullAccess: Bool, appControl: Bool,
                     session: String? = nil, resume: Bool = false, browser: Bool = false,
                     onOutput: @escaping (String) -> Void, onDone: @escaping (Int32) -> Void) -> Process? {
-        let agent = agentCommand(backend: backend, task: task + composioNote + (browser ? browserNote : ""),
+        let effectiveBrowser = browser && backend == "claude"
+        var settingsURL: URL?
+        if effectiveBrowser {
+            do {
+                let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
+                let data = try BrowserPolicy.settingsJSON(executablePath: executable)
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("heydebby-browser-policy-\(UUID().uuidString).json")
+                try data.write(to: url, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                      ofItemAtPath: url.path)
+                settingsURL = url
+            } catch {
+                onOutput("Failed to create the browser safety policy: \(error.localizedDescription)")
+                onDone(-1)
+                return nil
+            }
+        }
+        let agent = agentCommand(backend: backend,
+                                 task: task + composioNote
+                                    + (effectiveBrowser ? browserGuidance(profileURL: Profile.validStoredProfileURL) : ""),
                                  screenshotPath: screenshotPath, fullAccess: fullAccess, appControl: appControl,
-                                 session: session, resume: resume)
+                                 session: session, resume: resume, browser: effectiveBrowser,
+                                 settingsPath: settingsURL?.path)
         DebbyLog.write("AGENT (\(backend)) \(task)")
-        return spawn(cliPathPrefix + "exec \(agent)", onOutput: onOutput, onDone: onDone)
+        return spawn(cliPathPrefix + "exec \(agent)", onOutput: onOutput, onDone: { code in
+            if let settingsURL { try? FileManager.default.removeItem(at: settingsURL) }
+            onDone(code)
+        })
     }
 
     @discardableResult
-    static func spawn(_ command: String, onOutput: @escaping (String) -> Void,
+    static func spawn(_ command: String, logging: ProcessLogging = .standard,
+                      logSink: LogSink? = nil, onOutput: @escaping (String) -> Void,
                       onDone: @escaping (Int32) -> Void) -> Process? {
         let cmd = command + " 2>&1"
-        DebbyLog.write("RUN \(command)")
+        func logWrite(_ text: String) {
+            if let logSink { logSink.write(text) } else { DebbyLog.write(text) }
+        }
+        func logRaw(_ text: String) {
+            if let logSink { logSink.raw(text) } else { DebbyLog.raw(text) }
+        }
+        let privateLabel: String?
+        switch logging {
+        case .standard:
+            privateLabel = nil
+            logWrite("RUN \(command)")
+        case .privateOutput(let label):
+            privateLabel = label
+            logWrite("RUN \(label)")
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-lc", cmd]
@@ -182,13 +220,14 @@ enum AgentRunner {
                 return
             }
             if let s = String(data: d, encoding: .utf8) {
-                DebbyLog.raw(s)   // stream it: a run that hangs still leaves a trail
+                if privateLabel == nil { logRaw(s) }
                 onOutput(s)
             }
         }
         proc.terminationHandler = { p in
             exitCode = p.terminationStatus
-            DebbyLog.write("EXIT \(p.terminationStatus)")
+            if let privateLabel { logWrite("EXIT \(privateLabel) \(p.terminationStatus)") }
+            else { logWrite("EXIT \(p.terminationStatus)") }
             group.leave()
             // A few seconds is plenty for a pipe that's actually drained (EOF normally
             // arrives within milliseconds of exit); past that, a descendant is still
@@ -198,7 +237,7 @@ enum AgentRunner {
                 let stillWaiting = !finished
                 doneLock.unlock()
                 if stillWaiting {
-                    DebbyLog.write("EOF grace period expired — proceeding with partial output")
+                    logWrite("EOF grace period expired — proceeding with partial output")
                     pipe.fileHandleForReading.readabilityHandler = nil
                 }
                 finishOnce()
